@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use std::{
     collections::HashSet,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc::Sender,
         Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        mpsc::Sender,
     },
     thread,
 };
@@ -12,11 +12,14 @@ use windows::Win32::{
     Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM},
     System::LibraryLoader::GetModuleHandleW,
     UI::{
-        Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LWIN, VK_RWIN, VK_SHIFT},
+        Input::KeyboardAndMouse::{
+            GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+            SendInput, VIRTUAL_KEY, VK_LWIN, VK_RWIN, VK_SHIFT,
+        },
         WindowsAndMessaging::{
-            CallNextHookEx, GetMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
-            HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP,
-            WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+            CallNextHookEx, GetMessageW, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG,
+            PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN,
+            WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
         },
     },
 };
@@ -26,6 +29,8 @@ use crate::events::{AppEvent, HotkeyAction};
 static EVENT_TX: OnceLock<Sender<AppEvent>> = OnceLock::new();
 static CONSUMED_KEYS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 static WIN_KEY_DOWN: AtomicBool = AtomicBool::new(false);
+static WIN_PASSED_TO_WINDOWS: AtomicBool = AtomicBool::new(false);
+static WIN_VK_CODE: AtomicU32 = AtomicU32::new(0);
 static HOTKEY_TRIGGERED: AtomicBool = AtomicBool::new(false);
 
 pub struct KeyboardHook {
@@ -102,25 +107,34 @@ unsafe extern "system" fn low_level_keyboard_proc(
         let message = wparam.0 as u32;
         let vk = kb.vkCode;
 
+        if (kb.flags & LLKHF_INJECTED).0 != 0 {
+            return unsafe { CallNextHookEx(HHOOK(std::ptr::null_mut()), code, wparam, lparam) };
+        }
+
         let is_keydown = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
         let is_keyup = message == WM_KEYUP || message == WM_SYSKEYUP;
         let is_win = is_win_key(vk);
 
-        // Track Win key state explicitly
         if is_keydown && is_win {
             WIN_KEY_DOWN.store(true, Ordering::SeqCst);
+            WIN_PASSED_TO_WINDOWS.store(false, Ordering::SeqCst);
+            WIN_VK_CODE.store(vk, Ordering::SeqCst);
+            HOTKEY_TRIGGERED.store(false, Ordering::SeqCst);
+            return LRESULT(1);
         }
 
         if is_keyup && is_win {
-            WIN_KEY_DOWN.store(false, Ordering::SeqCst);
-            // If a hotkey was triggered, suppress the Win key release
-            if HOTKEY_TRIGGERED.swap(false, Ordering::SeqCst) {
-                return LRESULT(1);
-            }
-        }
+            let was_passed = WIN_PASSED_TO_WINDOWS.swap(false, Ordering::SeqCst);
+            let hotkey_triggered = HOTKEY_TRIGGERED.swap(false, Ordering::SeqCst);
 
-        if is_keydown && is_win {
-            // Suppress Win key press - we'll decide whether to let it through on release
+            if was_passed {
+                send_win_key(vk, true);
+            } else if !hotkey_triggered {
+                send_win_tap(vk);
+            }
+
+            WIN_KEY_DOWN.store(false, Ordering::SeqCst);
+            WIN_VK_CODE.store(0, Ordering::SeqCst);
             return LRESULT(1);
         }
 
@@ -134,6 +148,17 @@ unsafe extern "system" fn low_level_keyboard_proc(
                 }
                 return LRESULT(1);
             }
+
+            if win_pressed()
+                && !WIN_PASSED_TO_WINDOWS.load(Ordering::SeqCst)
+                && !is_modifier_key(vk)
+            {
+                let win_vk = WIN_VK_CODE.load(Ordering::SeqCst);
+                if win_vk != 0 {
+                    send_win_key(win_vk, false);
+                    WIN_PASSED_TO_WINDOWS.store(true, Ordering::SeqCst);
+                }
+            }
         }
 
         if is_keyup && unmark_key_consumed(vk) {
@@ -146,6 +171,10 @@ unsafe extern "system" fn low_level_keyboard_proc(
 
 fn decode_hotkey(vk_code: u32) -> Option<HotkeyAction> {
     if !win_pressed() {
+        return None;
+    }
+
+    if ctrl_pressed() || alt_pressed() {
         return None;
     }
 
@@ -180,12 +209,55 @@ fn shift_pressed() -> bool {
     key_down(VK_SHIFT.0 as i32)
 }
 
+fn ctrl_pressed() -> bool {
+    key_down(0x11)
+}
+
+fn alt_pressed() -> bool {
+    key_down(0x12)
+}
+
 fn key_down(vk: i32) -> bool {
     unsafe { (GetAsyncKeyState(vk) as u16) & 0x8000 != 0 }
 }
 
 fn is_win_key(vk_code: u32) -> bool {
     vk_code == VK_LWIN.0 as u32 || vk_code == VK_RWIN.0 as u32
+}
+
+fn is_modifier_key(vk_code: u32) -> bool {
+    matches!(vk_code, 0x10..=0x12 | 0xA0..=0xA5)
+}
+
+fn send_win_tap(vk_code: u32) {
+    send_win_key(vk_code, false);
+    send_win_key(vk_code, true);
+}
+
+fn send_win_key(vk_code: u32, key_up: bool) {
+    let flags = if key_up {
+        KEYEVENTF_KEYUP
+    } else {
+        Default::default()
+    };
+
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk_code as u16),
+                wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+
+    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+    if sent != 1 {
+        tracing::warn!("failed sending synthetic Win key event");
+    }
 }
 
 fn mark_key_consumed(vk_code: u32) -> bool {
